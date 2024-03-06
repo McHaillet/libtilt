@@ -37,19 +37,19 @@ def project_volume_real(volume: torch.Tensor, rotation_matrices: torch.Tensor) -
     projection_images: torch.Tensor
         `(batch, h, w)` array of 2D projection images sampled from `volume`.
     """
-    volume = torch.as_tensor(volume)
-    rotation_matrices = torch.as_tensor(rotation_matrices, dtype=torch.float)
-    volume_shape = torch.tensor(volume.shape)
+    volume = torch.as_tensor(volume, device=volume.device)
+    rotation_matrices = torch.as_tensor(rotation_matrices, dtype=torch.float, device=volume.device)
+    volume_shape = torch.tensor(volume.shape, device=volume.device)
     ps = padded_sidelength = int(3 ** 0.5 * torch.max(volume_shape))
     shape_difference = torch.abs(padded_sidelength - volume_shape)
-    padding = torch.empty(size=(3, 2), dtype=torch.int16)
+    padding = torch.empty(size=(3, 2), dtype=torch.int16, device=volume.device)
     padding[:, 0] = torch.div(shape_difference, 2, rounding_mode='floor')
     padding[:, 1] = shape_difference - padding[:, 0]
     torch_padding = torch.flip(padding, dims=(0,))  # dhw -> whd for torch.nn.functional.pad
     torch_padding = einops.rearrange(torch_padding, 'whd pad -> (whd pad)')
     volume = F.pad(volume, pad=tuple(torch_padding), mode='constant', value=0)
     padded_volume_shape = (ps, ps, ps)
-    volume_coordinates = coordinate_grid(image_shape=padded_volume_shape)
+    volume_coordinates = coordinate_grid(image_shape=padded_volume_shape, device=volume.device)
     volume_coordinates -= padded_sidelength // 2  # (d, h, w, zyx)
     volume_coordinates = torch.flip(volume_coordinates, dims=(-1,))  # (d, h, w, zyx)
     volume_coordinates = einops.rearrange(volume_coordinates, 'd h w zyx -> d h w zyx 1')
@@ -106,19 +106,19 @@ def project_image_real(image: torch.Tensor, rotation_matrices: torch.Tensor) -> 
     projection_lines: torch.Tensor
         `(batch, w)` array of 1D projection lines sampled from `image`.
     """
-    image = torch.as_tensor(image)
-    rotation_matrices = torch.as_tensor(rotation_matrices, dtype=torch.float)
-    image_shape = torch.tensor(image.shape)
+    image = torch.as_tensor(image, device=image.device)
+    rotation_matrices = torch.as_tensor(rotation_matrices, dtype=torch.float, device=image.device)
+    image_shape = torch.tensor(image.shape, device=image.device)
     ps = padded_sidelength = int(3 ** 0.5 * torch.max(image_shape))
     shape_difference = torch.abs(padded_sidelength - image_shape)
-    padding = torch.empty(size=(2, 2), dtype=torch.int16)
+    padding = torch.empty(size=(2, 2), dtype=torch.int16, device=image.device)
     padding[:, 0] = torch.div(shape_difference, 2, rounding_mode='floor')
     padding[:, 1] = shape_difference - padding[:, 0]
     torch_padding = torch.flip(padding, dims=(0,))  # hw -> wh for torch.nn.functional.pad
     torch_padding = einops.rearrange(torch_padding, 'wh pad -> (wh pad)')
     image = F.pad(image, pad=tuple(torch_padding), mode='constant', value=0)
     padded_image_shape = (ps, ps)
-    image_coordinates = coordinate_grid(image_shape=padded_image_shape)
+    image_coordinates = coordinate_grid(image_shape=padded_image_shape, device=image.device)
     image_coordinates -= padded_sidelength // 2  # (h, w, yx)
     image_coordinates = torch.flip(image_coordinates, dims=(-1,))  # (h, w, yx)
     image_coordinates = einops.rearrange(image_coordinates, 'h w yx -> h w yx 1')
