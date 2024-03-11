@@ -3,7 +3,8 @@ import torch
 import torch.nn.functional as F
 import einops
 import math
-from torch_cubic_spline_grids import CubicBSplineGrid1d
+import numpy as np
+from scipy import optimize
 
 from libtilt.backprojection import backproject_fourier
 from libtilt.fft_utils import dft_center
@@ -12,14 +13,14 @@ from libtilt.rescaling.rescale_fourier import rescale_2d
 from libtilt.shapes import circle
 from libtilt.shift.shift_image import shift_2d
 from libtilt.transformations import Ry, Rz, T
-from libtilt.projection import project_image_real, project_fourier
+from libtilt.projection import project_image_real, project_volume_real, project_fourier
 from libtilt.alignment import find_image_shift
 
 IMAGE_FILE = 'data/tomo200528_100.st'
 IMAGE_PIXEL_SIZE = 1.724
 STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 51, 3)
 TILT_AXIS_ANGLE_PRIOR = -30  # -88.7 according to mdoc, but I set it faulty to see if the optimization works
-ALIGNMENT_PIXEL_SIZE = 13.79 * 3
+ALIGNMENT_PIXEL_SIZE = 13.79 * 2
 # set 0 degree tilt as reference
 REFERENCE_TILT = STAGE_TILT_ANGLE_PRIORS.abs().argmin()
 
@@ -80,74 +81,58 @@ for i in range(REFERENCE_TILT, tilt_series.shape[0] - 1, 1):
     current_shift += shift
     coarse_shifts[i + 1] = current_shift
 
-# create aligned stack for common lines; apply the mask here to prevent recalculation
-coarse_aligned_masked = shift_2d(tilt_series, shifts=coarse_shifts) * coarse_alignment_mask
-# generate a weighting for the common line ROI by projecting the mask
-mask_weights = project_image_real(coarse_alignment_mask, torch.eye(2).reshape(1, 2, 2))
-mask_weights /= mask_weights.max()  # normalise to 0 and 1
 
-# optimize tilt axis angle
-grid_resolution = 1
-tilt_axis_grid = CubicBSplineGrid1d(resolution=grid_resolution, n_channels=1)
-tilt_axis_grid.data = torch.tensor([TILT_AXIS_ANGLE_PRIOR, ] * grid_resolution, dtype=torch.float32)
-interpolation_points = torch.linspace(0, 1, len(tilt_series))
+def optimize_tilt_axis_angle(aligned_ts, mask, x0):
+    aligned_masked = aligned_ts * mask
+    mask_weights = project_image_real(mask,
+                                      torch.eye(2).reshape(1, 2, 2))
+    mask_weights /= mask_weights.max()  # normalise to 0 and 1
 
-common_lines_optimiser = torch.optim.Adam(
-    tilt_axis_grid.parameters(),
-    lr=1,
-)
+    def f(x):
+        # for common lines each 2d image is projected perpendicular to the tilt axis,
+        # thus add 90 degrees
+        R = Rz(x + 90, zyx=False)[:, :2, :2]
 
-for epoch in range(200):
-    # interpolate the grid
-    tilt_axis_angles = tilt_axis_grid(interpolation_points)
+        projections = []
+        for i in range(len(aligned_masked)):
+            projections.append(
+                project_image_real(
+                    aligned_masked[i],
+                    R
+                ).squeeze()
+            )
+        projections = torch.stack(projections)
+        # projections = projections - einops.reduce(projections, 'tilt w -> tilt 1', reduction='mean')
+        # projections = projections / torch.std(projections, dim=(-1), keepdim=True)
+        # weight the lines by the projected mask
+        projections = projections * mask_weights
+        squared_differences = (projections - einops.rearrange(projections, 'b d -> b 1 d')) ** 2
+        loss = einops.reduce(squared_differences, 'b1 b2 d -> 1', reduction='mean')
+        return loss
 
-    # for common lines each 2d image is projected perpendicular to the tilt axis, thus add 90 degrees
-    R = Rz(tilt_axis_angles + 90, zyx=False)[:, :2, :2]
+    # print([(x, f(x)) for x in range(-80, -120, -1)])
 
-    projections = []
-    for i in range(len(coarse_aligned_masked)):
-        projections.append(
-            project_image_real(
-                coarse_aligned_masked[i],
-                R[i:i+1]
-            ).squeeze()
-        )
-    projections = torch.stack(projections)
-    projections = projections - einops.reduce(projections, 'tilt w -> tilt 1', reduction='mean')
-    projections = projections / torch.std(projections, dim=(-1), keepdim=True)
-    # weight the lines by the projected mask
-    projections = projections * mask_weights
+    pred = optimize.minimize_scalar(f, bounds=[x0 - 90, x0 + 90])
+    #
+    # import napari
+    # viewer = napari.Viewer()
+    # viewer.add_image(f(-91).detach().numpy(), name='-91')
+    # viewer.add_image(f(-111).detach().numpy(), name='-111')
+    # napari.run()
 
-    common_lines_optimiser.zero_grad()
-    squared_differences = (projections - einops.rearrange(projections, 'b d -> b 1 d')) ** 2
-    loss = einops.reduce(squared_differences, 'b1 b2 d -> 1', reduction='sum')
-    loss.backward()
-    common_lines_optimiser.step()
+    return pred
 
-    if not (epoch % 10):
-        print(epoch, loss.item(), tilt_axis_grid.data.mean())
 
-tilt_axis_prediction = tilt_axis_grid(interpolation_points).clone().detach()
-print('final tilt axis angle:', torch.unique(tilt_axis_prediction))
-
-# create the aligned stack
 coarse_aligned = shift_2d(tilt_series, shifts=coarse_shifts)
+tilt_axis_prediction = float(optimize_tilt_axis_angle(
+    coarse_aligned,
+    coarse_alignment_mask,
+    TILT_AXIS_ANGLE_PRIOR,
+).x)
+print('final tilt axis angle:', tilt_axis_prediction)
 
 tomogram_center = dft_center(tomogram_dimensions, rfft=False, fftshifted=True)
 tilt_image_center = dft_center(tilt_dimensions, rfft=False, fftshifted=True)
-
-s0 = T(-tomogram_center)
-r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
-r1 = Rz(TILT_AXIS_ANGLE_PRIOR, zyx=True)
-s2 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
-M = s2 @ r1 @ r0 @ s0
-
-# coarse reconstruction
-shifts_only_reconstruction = backproject_fourier(
-    images=coarse_aligned,
-    rotation_matrices=torch.linalg.inv(M[:, :3, :3]),
-    rotation_matrix_zyx=True,
-)
 
 s0 = T(-tomogram_center)
 r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
@@ -162,110 +147,89 @@ coarse_reconstruction = backproject_fourier(
     rotation_matrix_zyx=True,
 )
 
-roi_mask = torch.zeros_like(tilt_series)
-for i, theta in enumerate(STAGE_TILT_ANGLE_PRIORS):
-    offset = int((size // 2) * (1 - torch.abs(torch.cos(theta * math.pi / 180))))
-    if offset == 0:
-        roi_mask[i] = 1
-    else:
-        roi_mask[i, offset: -offset, :] = 1
 
-predicted_shifts = coarse_shifts.clone().detach().requires_grad_(True)
+def optimize_shifts(
+        tilt_series,
+        projection_matrices,
+        initial_shifts,
+        tilt_angles,
+        mask,
+):
+    roi_mask = torch.zeros_like(tilt_series)
+    for i, theta in enumerate(tilt_angles):
+        offset = int((size // 2) * (1 - torch.abs(torch.cos(theta * math.pi / 180))))
+        if offset == 0:
+            roi_mask[i] = 1
+        else:
+            roi_mask[i, offset: -offset, :] = 1
 
-projection_model_optimiser = torch.optim.Adam(
-    params=[predicted_shifts, ],
-    lr=0.1,
-)
-
-# optimise
-for i in range(50):
-    # Make an intermediate reconstruction from 80% of the data
-    with torch.no_grad():
-        tilt_mask = torch.rand((len(tilt_series))) < 0.20
-
-        # s0 = T(-tomogram_center)
-        # r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
-        # r1 = Rz(tilt_axis_prediction, zyx=True)
-        # s2 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
-        # M = s2 @ r1 @ r0 @ s0
-
+    shifts = initial_shifts.detach().clone()
+    indices = torch.arange(0, len(tilt_series))
+    for i in torch.randperm(len(tilt_series)):
         intermediate_recon = backproject_fourier(
             images=shift_2d(
-                tilt_series[tilt_mask], shifts=predicted_shifts[tilt_mask]
+                tilt_series[indices != i], shifts=shifts[indices != i]
             ),
-            rotation_matrices=torch.linalg.inv(M[:, :3, :3][tilt_mask]),
+            rotation_matrices=torch.linalg.inv(
+                projection_matrices[:, :3, :3][indices != i]
+            ),
             rotation_matrix_zyx=True,
         )
 
-    projections = project_fourier(
-        volume=intermediate_recon,
-        rotation_matrices=torch.linalg.inv(M[:, :3, :3][~tilt_mask]),
-        rotation_matrix_zyx=True
+        projection = project_fourier(
+            volume=intermediate_recon,
+            rotation_matrices=torch.linalg.inv(
+                projection_matrices[i: i+1, :3, :3]
+            ),
+            rotation_matrix_zyx=True
+        ).squeeze() * mask
+        projection = (projection - projection.mean()) / projection.std()
+        projection = projection  #* roi_mask[i]
+
+        experimental = shift_2d(
+            tilt_series[i: i+1], shifts=shifts[i: i+1]
+        ).squeeze() * mask  #* roi_mask[i]
+
+        shift = find_image_shift(projection, experimental)
+        print(shift)
+        shifts[i] += shift
+
+    return shifts
+
+
+shifts = coarse_shifts.detach().clone()
+for _ in range(5):
+    s0 = T(-tomogram_center)
+    r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
+    r1 = Rz(tilt_axis_prediction, zyx=True)
+    s2 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
+    M = s2 @ r1 @ r0 @ s0
+
+    shifts = optimize_shifts(
+        tilt_series, M, shifts, STAGE_TILT_ANGLE_PRIORS, coarse_alignment_mask
     )
-    projections = projections - torch.mean(projections, dim=(-2, -1), keepdim=True)
-    projections = projections / torch.std(projections, dim=(-2, -1), keepdim=True)
-    projections = projections * coarse_alignment_mask * roi_mask[~tilt_mask]
 
-    projection_model_optimiser.zero_grad()
+    fine_aligned = shift_2d(tilt_series, shifts=shifts)
 
-    experimental = shift_2d(
-        tilt_series[~tilt_mask], shifts=predicted_shifts[~tilt_mask]
-    ) * coarse_alignment_mask * roi_mask[~tilt_mask]
+    tilt_axis_prediction = float(optimize_tilt_axis_angle(
+        fine_aligned, coarse_alignment_mask, tilt_axis_prediction
+    ).x)
+    print('final tilt axis angle:', tilt_axis_prediction)
 
-    loss = torch.mean((experimental - projections) ** 2).sqrt()
-    loss.backward()
-    projection_model_optimiser.step()
-    print(i, loss.item())
-    # print(predicted_shifts)
+s0 = T(-tomogram_center)
+r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
+r1 = Rz(TILT_AXIS_ANGLE_PRIOR, zyx=True)
+s2 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
+M = s2 @ r1 @ r0 @ s0
 
-fine_aligned = shift_2d(tilt_series, shifts=predicted_shifts) * coarse_alignment_mask
-
-# optimize tilt axis angle
-grid_resolution = 1
-tilt_axis_grid = CubicBSplineGrid1d(resolution=grid_resolution, n_channels=1)
-tilt_axis_grid.data = torch.tensor([tilt_axis_prediction.mean(), ] * grid_resolution,
-                                   dtype=torch.float32)
-interpolation_points = torch.linspace(0, 1, len(tilt_series))
-
-common_lines_optimiser = torch.optim.Adam(
-    tilt_axis_grid.parameters(),
-    lr=1,
+# coarse reconstruction
+shifts_only_reconstruction = backproject_fourier(
+    images=coarse_aligned,
+    rotation_matrices=torch.linalg.inv(M[:, :3, :3]),
+    rotation_matrix_zyx=True,
 )
 
-for epoch in range(200):
-    # interpolate the grid
-    tilt_axis_angles = tilt_axis_grid(interpolation_points)
-
-    # for common lines each 2d image is projected perpendicular to the tilt axis, thus add 90 degrees
-    R = Rz(tilt_axis_angles + 90, zyx=False)[:, :2, :2]
-
-    projections = []
-    for i in range(len(coarse_aligned_masked)):
-        projections.append(
-            project_image_real(
-                coarse_aligned_masked[i],
-                R[i:i+1]
-            ).squeeze()
-        )
-    projections = torch.stack(projections)
-    projections = projections - einops.reduce(projections, 'tilt w -> tilt 1', reduction='mean')
-    projections = projections / torch.std(projections, dim=(-1), keepdim=True)
-    # weight the lines by the projected mask
-    projections = projections * mask_weights
-
-    common_lines_optimiser.zero_grad()
-    squared_differences = (projections - einops.rearrange(projections, 'b d -> b 1 d')) ** 2
-    loss = einops.reduce(squared_differences, 'b1 b2 d -> 1', reduction='sum')
-    loss.backward()
-    common_lines_optimiser.step()
-
-    if not (epoch % 10):
-        print(epoch, loss.item(), tilt_axis_grid.data.mean())
-
-tilt_axis_prediction = tilt_axis_grid(interpolation_points).clone().detach()
-print('final tilt axis angle:', torch.unique(tilt_axis_prediction))
-
-fine_aligned = shift_2d(tilt_series, shifts=predicted_shifts)
+fine_aligned = shift_2d(tilt_series, shifts=shifts)
 
 s0 = T(-tomogram_center)
 r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
@@ -280,13 +244,19 @@ fine_reconstruction = backproject_fourier(
     rotation_matrix_zyx=True,
 )
 
+mrcfile.write(
+    'data/tomo200528_100.mrc',
+    fine_reconstruction.detach().numpy().astype(np.float32),
+    voxel_size=ALIGNMENT_PIXEL_SIZE,
+    overwrite=True,
+)
+
 import napari
 
 viewer = napari.Viewer()
 viewer.add_image(tilt_series.detach().numpy(), name='experimental')
 viewer.add_image(coarse_aligned.detach().numpy(), name='coarse aligned')
 viewer.add_image(fine_aligned.detach().numpy(), name='fine aligned')
-viewer.add_image((roi_mask * fine_aligned).detach().numpy(), name='masked')
 # viewer.add_image(shifts_only_reconstruction.detach().numpy(), name='shifts only
 # reconstruction')
 viewer.add_image(coarse_reconstruction.detach().numpy(), name='coarse reconstruction')
