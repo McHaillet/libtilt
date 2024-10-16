@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import einops
 import math
 import numpy as np
+import napari
 from scipy import optimize
 
 from libtilt.backprojection import backproject_fourier
@@ -16,11 +17,11 @@ from libtilt.transformations import Ry, Rz, T
 from libtilt.projection import project_image_real, project_volume_real, project_fourier
 from libtilt.alignment import find_image_shift
 
-IMAGE_FILE = 'data/tomo200528_100.st'
+IMAGE_FILE = 'data/tomo200528_107.st'
 IMAGE_PIXEL_SIZE = 1.724
-STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 51, 3)
+STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 54, 3)
 TILT_AXIS_ANGLE_PRIOR = -30  # -88.7 according to mdoc, but I set it faulty to see if the optimization works
-ALIGNMENT_PIXEL_SIZE = 13.79 * 2
+ALIGNMENT_PIXEL_SIZE = 13.79 * 4
 # set 0 degree tilt as reference
 REFERENCE_TILT = STAGE_TILT_ANGLE_PRIORS.abs().argmin()
 
@@ -61,12 +62,21 @@ reference_shift = torch.tensor([.0, .0])
 center = dft_center(tilt_dimensions, rfft=False, fftshifted=True)
 coarse_shifts = torch.zeros((len(tilt_series), 2), dtype=torch.float32)
 
+roi_mask = torch.zeros_like(tilt_series)
+for i, theta in enumerate(STAGE_TILT_ANGLE_PRIORS):
+    offset = int((size // 2) * (1 - torch.abs(torch.cos(theta * math.pi / 180))))
+    if offset == 0:
+        roi_mask[i] = 1
+    else:
+        roi_mask[i, offset: -offset, :] = 1
+full_mask = roi_mask * torch.unsqueeze(coarse_alignment_mask, 0)
+
 # find coarse alignment for negative tilts
 current_shift = reference_shift.clone()
 for i in range(REFERENCE_TILT, 0, -1):
     shift = find_image_shift(
-        tilt_series[i] * coarse_alignment_mask,
-        tilt_series[i - 1] * coarse_alignment_mask,
+        tilt_series[i] * full_mask[i - 1],
+        tilt_series[i - 1] * full_mask[i - 1],
     )
     current_shift += shift
     coarse_shifts[i - 1] = current_shift
@@ -75,12 +85,13 @@ for i in range(REFERENCE_TILT, 0, -1):
 current_shift = reference_shift.clone()
 for i in range(REFERENCE_TILT, tilt_series.shape[0] - 1, 1):
     shift = find_image_shift(
-        tilt_series[i] * coarse_alignment_mask,
-        tilt_series[i + 1] * coarse_alignment_mask,
+        tilt_series[i] * full_mask[i + 1],
+        tilt_series[i + 1] * full_mask[i + 1],
     )
     current_shift += shift
     coarse_shifts[i + 1] = current_shift
 
+print(coarse_shifts)
 
 def optimize_tilt_axis_angle(aligned_ts, mask, x0):
     aligned_masked = aligned_ts * mask
@@ -122,7 +133,6 @@ def optimize_tilt_axis_angle(aligned_ts, mask, x0):
 
     return pred
 
-
 coarse_aligned = shift_2d(tilt_series, shifts=coarse_shifts)
 tilt_axis_prediction = float(optimize_tilt_axis_angle(
     coarse_aligned,
@@ -130,6 +140,71 @@ tilt_axis_prediction = float(optimize_tilt_axis_angle(
     TILT_AXIS_ANGLE_PRIOR,
 ).x)
 print('final tilt axis angle:', tilt_axis_prediction)
+
+def stretch(image, stretch, tilt_axis):
+    cos_phi = math.cos(math.radians(tilt_axis))
+    sin_phi = math.sin(math.radians(tilt_axis))
+    m_rotate_forward = torch.tensor([[cos_phi, -sin_phi, 0],
+                                     [sin_phi, cos_phi, 0],
+                                     [0, 0, 1]])
+    m_rotate_backward = torch.linalg.inv(m_rotate_forward)
+    m_scale = torch.tensor([[stretch, 0, 0],
+                            [0, 1, 0],
+                            [0, 0, 1]])
+    m_affine = m_rotate_backward @ m_scale @ m_rotate_forward
+    m_affine = torch.unsqueeze(m_affine[:2], 0)
+    flow_grid = F.affine_grid(m_affine, (1, 1, size, size), align_corners=True)
+    new = F.grid_sample(torch.unsqueeze(torch.unsqueeze(image, 0), 0), flow_grid,
+                  mode='bicubic', align_corners=True)
+    return new[0, 0]
+
+coarse_shifts = torch.zeros((len(tilt_series), 2), dtype=torch.float32)
+# find coarse alignment for negative tilts
+current_shift = reference_shift.clone()
+for i in range(REFERENCE_TILT, 0, -1):
+    shift = find_image_shift(
+        tilt_series[i] * full_mask[i - 1],
+        stretch(
+            tilt_series[i - 1],
+            math.cos(math.radians(STAGE_TILT_ANGLE_PRIORS[i - 1])) /
+                math.cos(math.radians(STAGE_TILT_ANGLE_PRIORS[i])),
+            tilt_axis_prediction
+        ) * full_mask[i - 1]
+    )
+    current_shift += shift
+    coarse_shifts[i - 1] = current_shift
+
+# find coarse alignment positive tilts
+current_shift = reference_shift.clone()
+for i in range(REFERENCE_TILT, tilt_series.shape[0] - 1, 1):
+    shift = find_image_shift(
+        tilt_series[i] * full_mask[i + 1],
+        stretch(
+            tilt_series[i + 1],
+            math.cos(math.radians(STAGE_TILT_ANGLE_PRIORS[i + 1])) /
+                math.cos(math.radians(STAGE_TILT_ANGLE_PRIORS[i])),
+            tilt_axis_prediction
+        ) * full_mask[i + 1]
+    )
+
+    current_shift += shift
+    coarse_shifts[i + 1] = current_shift
+
+print('round2')
+print(coarse_shifts)
+
+coarse_aligned = shift_2d(tilt_series, shifts=coarse_shifts)
+tilt_axis_prediction = float(optimize_tilt_axis_angle(
+    coarse_aligned,
+    coarse_alignment_mask,
+    tilt_axis_prediction,
+).x)
+print('final tilt axis angle:', tilt_axis_prediction)
+# viewer = napari.Viewer()
+# viewer.add_image((tilt_series * full_mask)[1:].detach().numpy(), name='experimental1')
+# viewer.add_image((tilt_series * full_mask)[0:-1].detach().numpy(), name='experimental2')
+# napari.run()
+
 
 tomogram_center = dft_center(tomogram_dimensions, rfft=False, fftshifted=True)
 tilt_image_center = dft_center(tilt_dimensions, rfft=False, fftshifted=True)
@@ -147,6 +222,32 @@ coarse_reconstruction = backproject_fourier(
     rotation_matrix_zyx=True,
 )
 
+mrcfile.write(
+    'data/tomo200528_107.mrc',
+    coarse_reconstruction.detach().numpy().astype(np.float32),
+    voxel_size=ALIGNMENT_PIXEL_SIZE,
+    overwrite=True,
+)
+
+viewer = napari.Viewer()
+viewer.add_image(full_mask.detach().numpy())
+viewer.add_image(tilt_series.detach().numpy(), name='experimental')
+viewer.add_image(coarse_aligned.detach().numpy(), name='coarse aligned')
+viewer.add_image(coarse_reconstruction.detach().numpy(), name='coarse reconstruction')
+napari.run()
+
+
+def normalise_under_mask(stack, mask):
+    p = torch.sum(mask, dim=(-2, -1), keepdim=True)
+    stack_masked = stack * mask
+    mean = torch.sum(stack_masked, dim=(-2, -1), keepdim=True) / p
+    std = (torch.sum(
+        stack_masked ** 2, dim=(-2, -1), keepdim=True
+    ) / p - mean ** 2) ** 0.5
+    new_stack = (stack - mean) / std
+    new_stack = new_stack * mask
+    return new_stack
+
 
 def optimize_shifts(
         tilt_series,
@@ -162,43 +263,62 @@ def optimize_shifts(
             roi_mask[i] = 1
         else:
             roi_mask[i, offset: -offset, :] = 1
+    full_mask = roi_mask * mask
 
-    shifts = initial_shifts.detach().clone()
-    indices = torch.arange(0, len(tilt_series))
-    for i in torch.randperm(len(tilt_series)):
-        intermediate_recon = backproject_fourier(
-            images=shift_2d(
-                tilt_series[indices != i], shifts=shifts[indices != i]
-            ),
-            rotation_matrices=torch.linalg.inv(
-                projection_matrices[:, :3, :3][indices != i]
-            ),
-            rotation_matrix_zyx=True,
-        )
+    predicted_shifts = initial_shifts.detach().clone().requires_grad_(True)
+    optimiser = torch.optim.Adam(
+        params=[predicted_shifts, ],
+        lr=1,  # .1
+    )
 
-        projection = project_fourier(
-            volume=intermediate_recon,
-            rotation_matrices=torch.linalg.inv(
-                projection_matrices[i: i+1, :3, :3]
-            ),
-            rotation_matrix_zyx=True
-        ).squeeze() * mask
-        projection = (projection - projection.mean()) / projection.std()
-        projection = projection  #* roi_mask[i]
+    tilt_mask = torch.arange(len(tilt_series))
+    for epoch in range(50):
+        with (torch.no_grad()):
+            projections = []
+            for i in range(len(tilt_series)):
+                # print(i)
+                intermediate_recon = backproject_fourier(
+                    images=shift_2d(
+                        tilt_series[tilt_mask != i], shifts=predicted_shifts[
+                            tilt_mask != i]
+                    ),
+                    rotation_matrices=torch.linalg.inv(
+                        projection_matrices[:, :3, :3][tilt_mask != i]
+                    ),
+                    rotation_matrix_zyx=True,
+                )
 
+                projections.append(project_fourier(
+                    volume=intermediate_recon,
+                    rotation_matrices=torch.linalg.inv(
+                        projection_matrices[i: i+1, :3, :3]
+                    ),
+                    rotation_matrix_zyx=True
+                ).squeeze())
+            projections = normalise_under_mask(torch.stack(projections), full_mask)
+
+        optimiser.zero_grad()
         experimental = shift_2d(
-            tilt_series[i: i+1], shifts=shifts[i: i+1]
-        ).squeeze() * mask  #* roi_mask[i]
+            tilt_series, shifts=predicted_shifts
+        ).squeeze()
+        experimental = normalise_under_mask(experimental, full_mask)
 
-        shift = find_image_shift(projection, experimental)
-        print(shift)
-        shifts[i] += shift
+        loss = torch.mean(torch.abs(experimental - projections) ** 2).sqrt()
+        loss.backward()
+        optimiser.step()
+        print(epoch, loss)
 
-    return shifts
+    viewer = napari.Viewer()
+    viewer.add_image(experimental.detach().numpy(), name='experimental')
+    viewer.add_image(projections.detach().numpy(), name='predicted')
+    viewer.add_image(((experimental - projections) ** 2).detach().numpy())
+    napari.run()
+
+    return predicted_shifts.clone().detach().requires_grad_(False)
 
 
 shifts = coarse_shifts.detach().clone()
-for _ in range(5):
+for _ in range(1):
     s0 = T(-tomogram_center)
     r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
     r1 = Rz(tilt_axis_prediction, zyx=True)
@@ -245,13 +365,11 @@ fine_reconstruction = backproject_fourier(
 )
 
 mrcfile.write(
-    'data/tomo200528_100.mrc',
+    'data/tomo200528_107.mrc',
     fine_reconstruction.detach().numpy().astype(np.float32),
     voxel_size=ALIGNMENT_PIXEL_SIZE,
     overwrite=True,
 )
-
-import napari
 
 viewer = napari.Viewer()
 viewer.add_image(tilt_series.detach().numpy(), name='experimental')

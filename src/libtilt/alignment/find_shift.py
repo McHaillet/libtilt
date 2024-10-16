@@ -10,7 +10,6 @@ from libtilt.fft_utils import dft_center
 def find_image_shift(
         image_a: torch.Tensor,
         image_b: torch.Tensor,
-        upsampling_factor: float = 10,
 ) -> torch.Tensor:
     """Find the shift between image a and b. Applying the shift to b aligns it with
     image a. The region around the maximum in the correlation image is by default
@@ -22,23 +21,15 @@ def find_image_shift(
         `(h, w)` image.
     image_b: torch.Tensor
         `(h, w)` image with the same shape as image_a
-    upsampling_factor: float
-        How many times the correlation image is upsampled with bicubic
-        interpolation to find an interpolated shift. The value needs to be larger or
-        equal to 1.
 
     Returns
     -------
     shift: torch.Tensor
         `(2, )` shift in y and x.
     """
-    if upsampling_factor < 1:
-        raise ValueError('Upsampling factor for finding a shift between two images '
-                         'cannot be smaller than 1.')
     center = dft_center(
         image_a.shape, rfft=False, fftshifted=True, device=image_a.device
     )
-    image_shape = torch.tensor(image_a.shape, device=image_a.device)
 
     # calculate initial shift with integer precision
     correlation = correlate_2d(
@@ -50,34 +41,18 @@ def find_image_shift(
         np.unravel_index(correlation.argmax().cpu(), shape=image_a.shape),
         device=image_a.device
     )
-    shift = maximum_idx - center
+    y, x = maximum_idx
+    # Parabolic interpolation in the y direction
+    f_y0 = correlation[y - 1, x]
+    f_y1 = correlation[y, x]
+    f_y2 = correlation[y + 1, x]
+    subpixel_dy = y + 0.5 * (f_y0 - f_y2) / (f_y0 - 2 * f_y1 + f_y2)
 
-    # attempt interpolating the shift for higher precision
-    if upsampling_factor == 1:
-        return shift
-    elif torch.any(maximum_idx < 2) or torch.any(image_shape - maximum_idx < 3):
-        # if the maximum is too close to the border, it cannot be upsampled
-        return shift
-    else:
-        # find interpolated shift by upsampling the correlation image
-        peak_region_y = slice(maximum_idx[0] - 2, maximum_idx[0] + 3)
-        peak_region_x = slice(maximum_idx[1] - 2, maximum_idx[1] + 3)
-        upsampled = F.interpolate(
-            einops.rearrange(
-                correlation[peak_region_y, peak_region_x],
-                'h w -> 1 1 h w'
-            ),
-            scale_factor=upsampling_factor,
-            mode='bicubic',
-            align_corners=True
-        )
-        upsampled = einops.rearrange(upsampled, '1 1 h w -> h w')
-        upsampled_center = dft_center(
-            upsampled.shape, rfft=False, fftshifted=True, device=image_a.device
-        )
-        upsampled_shift = torch.tensor(
-            np.unravel_index(upsampled.argmax().cpu(), shape=upsampled.shape),
-            device=image_a.device
-        ) - upsampled_center
-        full_shift = shift + upsampled_shift / upsampling_factor
-        return full_shift
+    # Parabolic interpolation in the x direction
+    f_x0 = correlation[y, x - 1]
+    f_x1 = correlation[y, x]
+    f_x2 = correlation[y, x + 1]
+    subpixel_dx = x + 0.5 * (f_x0 - f_x2) / (f_x0 - 2 * f_x1 + f_x2)
+
+    shift = torch.tensor([subpixel_dy, subpixel_dx]) - center
+    return shift
