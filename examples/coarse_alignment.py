@@ -1,4 +1,6 @@
 import math
+from pathlib import Path
+from typing import Sequence
 
 import einops
 import mrcfile
@@ -10,23 +12,39 @@ from torch_cubic_spline_grids import CubicBSplineGrid1d
 
 from libtilt.alignment import find_image_shift
 from libtilt.backprojection import backproject_fourier
+from libtilt.coordinate_utils import array_to_grid_sample, homogenise_coordinates
 from libtilt.fft_utils import dft_center
-from libtilt.filters import low_pass_filter
+from libtilt.grids import coordinate_grid
 from libtilt.patch_extraction import extract_squares
-from libtilt.projection import project_fourier, project_image_real
+from libtilt.projection import project_image_real
 from libtilt.rescaling.rescale_fourier import rescale_2d
 from libtilt.shapes import circle
 from libtilt.shift.shift_image import shift_2d
-from libtilt.transformations import Ry, Rz, T
+from libtilt.transformations import R_2d, Ry, Rz, T, T_2d
 
-IMAGE_FILE = "data/tomo200528_107.st"
+# TODO write some functions like
+# def affine_transform_2d(
+#       images: torch.Tensor,  # shape: 'n h w'
+#       affine_matrices: torch.Tensor,  # shape: 'n 3 3'
+#       interpolation: str = 'bicubic,
+# ):
+#
+# def affine_transform_3d(
+#       volumes: torch.Tensor,  # shape: 'n d h w'
+#       affine_matrices: torch.Tensor,  # shape: 'n 4 4'
+#       interpolation: str = 'bilinear',  # is actually trilinear in grid_sample
+# ):
+#
+# def back_project_real(images, volume_shape, affine_matrices):
+
+IMAGE_FILE = Path("data/tomo200528_100.st")
 IMAGE_PIXEL_SIZE = 1.724
-STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 54, 3)
+STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 51, 3)  # 107: 54, 100: 51
 TILT_AXIS_ANGLE_PRIOR = -90.0  # -88.7 according to mdoc, but I set it faulty to see if
 # the optimization works
-ALIGNMENT_PIXEL_SIZE = 13.79 * 2
+ALIGNMENT_PIXEL_SIZE = 13.79
 # set 0 degree tilt as reference
-REFERENCE_TILT = STAGE_TILT_ANGLE_PRIORS.abs().argmin()
+REFERENCE_TILT = int(STAGE_TILT_ANGLE_PRIORS.abs().argmin())
 
 tilt_series = torch.as_tensor(mrcfile.read(IMAGE_FILE))
 
@@ -59,13 +77,6 @@ coarse_alignment_mask = circle(
     smoothing_radius=size // 6,
     image_shape=tilt_dimensions,
 )
-
-ramp_weights = (
-    torch.abs(torch.arange(-size // 2 + size % 2, size // 2 + size % 2, 1.0))
-    / (size // 2)
-).repeat(
-    size, 1
-)  # tilt images usually rotate around x-axis
 
 # do an IMOD style coarse tilt-series alignment
 center = dft_center(tilt_dimensions, rfft=False, fftshifted=True)
@@ -165,28 +176,24 @@ def optimize_tilt_axis_angle(
     tilt_axis_angles = tilt_axis_grid(interpolation_points)
     # print(tilt_axis_angles)
 
-    return tilt_axis_angles
+    return tilt_axis_angles.detach()
 
 
 def stretch(image, stretch, tilt_axis):
     """Stretch an image along the tilt axis."""
-    cos_phi = math.cos(math.radians(tilt_axis))
-    sin_phi = math.sin(math.radians(tilt_axis))
-    m_rotate_forward = torch.tensor(
-        [[cos_phi, -sin_phi, 0], [sin_phi, cos_phi, 0], [0, 0, 1]]
-    )
-    m_rotate_backward = torch.linalg.inv(m_rotate_forward)
+    m_rotate_backward = R_2d(tilt_axis, yx=True)
+    m_rotate_forward = torch.linalg.inv(m_rotate_backward)
     m_scale = torch.tensor([[stretch, 0, 0], [0, 1, 0], [0, 0, 1]])
-    m_affine = m_rotate_backward @ m_scale @ m_rotate_forward
-    m_affine = torch.unsqueeze(m_affine[:2], 0)
+    # F.affine grid requires 2 x 3 matrices
+    m_affine = (m_rotate_backward @ m_scale @ m_rotate_forward)[:, :2]
     flow_grid = F.affine_grid(m_affine, (1, 1, size, size), align_corners=True)
-    new = F.grid_sample(
+    stretched = F.grid_sample(
         einops.rearrange(image, "h w -> 1 1 h w"),
         flow_grid,
         mode="bicubic",
         align_corners=True,
-    )
-    return new[0, 0]
+    ).squeeze()
+    return stretched
 
 
 def coarse_align(tilt_series, mask, tilt_angles, tilt_axis_angle):
@@ -243,12 +250,303 @@ for i in range(2):
     print("new shifts:", shifts)
     coarse_aligned = shift_2d(tilt_series, shifts=shifts)
 
-# viewer = napari.Viewer()
-# viewer.add_image((tilt_series * full_mask)[1:].detach().numpy(), name='experimental1')
-# viewer.add_image((tilt_series * full_mask)[0:-1].detach().numpy(),
-# name='experimental2')
-# napari.run()
 
+def filtered_back_projection(
+    tilt_series,
+    tomogram_dimensions,
+    tilt_angles,
+    tilt_axis_angles,
+    shifts,
+    weighting="exact",
+):
+    """Run weighted back projection incorporating some alignment parameters.
+
+    ramp-weighting increases linearly from 0 to 1 from the zero frequency to nyquist
+    exact-weighting is based on and improves low-res signal on forward projection:
+        Reference : Optik, Exact filters for general geometry three-dimensional
+        reconstruction, vol.73,146,1986.
+
+    """
+    # initializes sizes
+    device = tilt_series.device
+    n_tilts, size, _ = tilt_series.shape  # for simplicity assume square images
+    tilt_image_dimensions = (size, size)
+    tomogram_center = dft_center(tomogram_dimensions, rfft=False, fftshifted=True)
+    tilt_image_center = dft_center(tilt_image_dimensions, rfft=False, fftshifted=True)
+
+    # generate the 2d alignment affine matrix
+    s0 = T_2d(-tilt_image_center)
+    r0 = R_2d(tilt_axis_angles, yx=True)
+    s1 = T_2d(-shifts)
+    s2 = T_2d(tilt_image_center)
+    M = einops.rearrange((s2 @ s1 @ r0 @ s0), "... i j -> ... 1 1 i j").to(device)
+
+    grid = homogenise_coordinates(coordinate_grid(tilt_image_dimensions, device=device))
+    grid = einops.rearrange(grid, "h w coords -> h w coords 1")
+    grid = M @ grid
+    grid = einops.rearrange(grid, "... d h w coords 1 -> ... d h w coords")[
+        ..., :2
+    ].contiguous()
+    grid_sample_coordinates = array_to_grid_sample(grid, tilt_image_dimensions)
+    aligned = torch.squeeze(
+        F.grid_sample(
+            einops.rearrange(tilt_series, "n h w -> n 1 h w"),
+            grid_sample_coordinates,
+            align_corners=True,
+            mode="bicubic",
+        )
+    )
+
+    # generate weighting function and apply to aligned tilt series
+    if weighting == "exact":
+        if len(tilt_angles) == 1:
+            filters = 1
+        else:
+            freq = einops.rearrange(
+                torch.arange(
+                    size // 2 + size % 2 + 1, dtype=torch.float32, device=device
+                ),
+                "q -> 1 1 q",
+            )
+            sampling = torch.sin(
+                torch.deg2rad(
+                    torch.abs(einops.rearrange(tilt_angles, "n -> n 1") - tilt_angles)
+                )
+            ).to(device)
+            slice_width = einops.reduce(
+                sampling[sampling > 0.001].reshape(n_tilts, n_tilts - 1),
+                "h w -> h",
+                "min",
+            ) * (size // 2)
+            slice_width = einops.rearrange(slice_width, "n -> 1 n 1")
+            sampling = einops.rearrange(sampling, "n m -> n m 1")
+
+            filters = 1 / einops.reduce(
+                torch.clip(1 - (sampling / slice_width * freq) ** 2, 0, 2),
+                "n m q -> n q",
+                "sum",
+            )
+            filters = einops.rearrange(filters, "n w -> n 1 w")
+    elif weighting == "ramp":
+        filters = torch.arange(
+            size // 2 + size % 2 + 1, dtype=torch.float32, device=device
+        )
+        filters /= filters.max()
+    else:
+        raise ValueError("Invalid weighting option provided for FBP.")
+
+    weighted = torch.fft.irfftn(
+        torch.fft.rfftn(aligned, dim=(-2, -1)) * filters, dim=(-2, -1)
+    )
+    if len(weighted.shape) == 2:  # rfftn gets rid of batch dimension: add it back
+        weighted = einops.rearrange(weighted, "h w -> 1 h w")
+
+    # time for real space back projection
+    s0 = T(-tomogram_center)
+    r0 = Ry(tilt_angles, zyx=True)
+    s1 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
+    M = einops.rearrange(s1 @ r0 @ s0, "... i j -> ... 1 1 i j").to(device)
+
+    reconstruction = torch.zeros(
+        tomogram_dimensions, dtype=torch.float32, device=device
+    )
+    grid = homogenise_coordinates(coordinate_grid(tomogram_dimensions, device=device))
+    grid = einops.rearrange(grid, "d h w coords -> d h w coords 1")
+
+    for i in range(n_tilts):
+        grid_t = M[i] @ grid
+        grid_t = einops.rearrange(grid_t, "... d h w coords 1 -> ... d h w coords")[
+            ..., :3
+        ].contiguous()
+        grid_sample_coordinates = array_to_grid_sample(grid_t, tomogram_dimensions)
+        reconstruction += torch.squeeze(
+            F.grid_sample(
+                einops.rearrange(weighted[i], "h w -> 1 1 1 h w"),
+                einops.rearrange(
+                    grid_sample_coordinates, "d h w coords -> 1 d h w coords"
+                ),
+                align_corners=True,
+                mode="bilinear",
+            )
+        )
+    return reconstruction
+
+
+def predict_projection(
+    tomogram,
+    tilt_image_dimensions,
+    tilt_angles,
+    tilt_axis_angles,
+    shifts,
+    view: bool = False,
+):
+    """Predict a projection from an intermediate reconstruction.
+
+    For now only assumes to project with a single matrix, but should also work for
+    sets of matrices.
+    """
+    device = tomogram.device
+    tomogram_dimensions = tomogram.shape
+    tomogram_center = dft_center(tomogram_dimensions, rfft=False, fftshifted=True)
+    # tilt_image_center = dft_center(tilt_image_dimensions, rfft=False, fftshifted=True)
+    # TODO project to proper image dimensions
+
+    # time for real space projection
+    s0 = T(-tomogram_center)
+    r0 = Ry(tilt_angles, zyx=True)
+    r1 = Rz(tilt_axis_angles, zyx=True)
+    s1 = T(F.pad(-shifts, pad=(1, 0), value=0))
+    s2 = T(tomogram_center)
+    M = einops.rearrange(
+        torch.linalg.inv(s2 @ s1 @ r1 @ r0 @ s0), "... i j -> ... 1 1 i j"
+    ).to(device)
+
+    grid = homogenise_coordinates(coordinate_grid(tomogram_dimensions, device=device))
+    grid = einops.rearrange(grid, "d h w coords -> d h w coords 1")
+    grid = M @ grid
+    grid = einops.rearrange(grid, "... d h w coords 1 -> ... d h w coords")[
+        ..., :3
+    ].contiguous()
+    grid_sample_coordinates = array_to_grid_sample(grid, tomogram_dimensions)
+    rotated = torch.squeeze(
+        F.grid_sample(
+            einops.rearrange(tomogram, "d h w -> 1 1 d h w"),
+            einops.rearrange(grid_sample_coordinates, "d h w coords -> 1 d h w coords"),
+            align_corners=True,
+            mode="bilinear",
+        )
+    )
+    if view:
+        viewer = napari.Viewer()
+        layer = viewer.add_image(rotated.to("cpu").detach().numpy())
+        layer._keep_auto_contrast = True
+        napari.run()
+    projection = rotated.mean(axis=-3)
+    weights = (rotated != 0).sum(axis=-3)
+    weights = weights / weights.max()
+    return projection, weights
+
+
+def projection_matching(
+    tilt_series: torch.Tensor,
+    tomogram_dimensions: Sequence[int],
+    reference_tilt_id: int,
+    tilt_angles: torch.Tensor,
+    tilt_axis_angles: torch.Tensor,
+    current_shifts: torch.Tensor,
+    alignment_mask: torch.Tensor,
+    debug: bool = False,
+):
+    """Run projection matching."""
+    n_tilts, size, _ = tilt_series.shape
+    aligned_set = [reference_tilt_id]
+    shifts = current_shifts.detach().clone()
+
+    # generate indices by alternating postive/negative tilts
+    max_offset = max(reference_tilt_id, len(tilt_angles) - reference_tilt_id - 1)
+    index_sequence = []
+    for i in range(1, max_offset + 1):  # skip reference
+        if reference_tilt_id + i < len(tilt_angles):
+            index_sequence.append(reference_tilt_id + i)
+        if i > 0 and reference_tilt_id - i >= 0:
+            index_sequence.append(reference_tilt_id - i)
+
+    # if debug:  # for debug mode, store the predicted projections
+    projections = torch.zeros((n_tilts, size, size))
+
+    for i in index_sequence:
+        tilt_angle = tilt_angles[i]
+        weights = einops.rearrange(
+            torch.cos(torch.deg2rad(torch.abs(tilt_angles - tilt_angle))),
+            "n -> n 1 1",
+        )
+        intermediate_recon = filtered_back_projection(
+            (tilt_series[aligned_set,] * weights[aligned_set,]).to("cuda"),
+            tomogram_dimensions,
+            tilt_angles[aligned_set,],
+            tilt_axis_angles[aligned_set,],
+            shifts[aligned_set,],
+        )
+        projection, projection_weights = predict_projection(
+            intermediate_recon,
+            (size, size),
+            tilt_angles[[i],],
+            tilt_axis_angles[[i],],
+            shifts[[i],],
+            # view=i==33
+        )  # TODO the volume edges introduce edges in the projected image
+        # ensure correlation in relevant area
+        projection_weights *= alignment_mask.to("cuda")
+        shift = find_image_shift(
+            tilt_series[i].to("cuda") * projection_weights,
+            projection * projection_weights,
+        )
+        shifts[i] -= shift.to("cpu")
+        aligned_set.append(i)
+
+        print(  # TODO should be some sort of logging?
+            f"aligned index {i} at angle {tilt_angle}: " f"{shift}"
+        )
+
+        # mainly for debug
+        projections[i] = (projection * projection_weights).detach().to("cpu")
+
+    return shifts, projections
+
+
+# coarse reconstruction
+initial_reconstruction = filtered_back_projection(
+    tilt_series, (170, size, size), STAGE_TILT_ANGLE_PRIORS, tilt_axis_angle, shifts
+)
+
+
+# some optimizations parameters
+max_iter = 10  # this seems solid
+tolerance = 0.1  # should probably be related to pixel size
+predicted_tilts = []
+for i in range(max_iter):
+    print(f"projection matching iteration {i}")
+    tilt_axis_angle = optimize_tilt_axis_angle(
+        shift_2d(tilt_series, shifts=shifts),
+        coarse_alignment_mask,
+        tilt_axis_angle,
+    )
+    print("new tilt axis angle:", tilt_axis_angle)
+
+    new_shifts, pred = projection_matching(
+        tilt_series,
+        (160, size, size),
+        REFERENCE_TILT,
+        STAGE_TILT_ANGLE_PRIORS,
+        tilt_axis_angle,
+        shifts,
+        coarse_alignment_mask,
+        debug=False,
+    )
+    predicted_tilts.append(pred)
+
+    if torch.all(torch.abs(shifts - new_shifts) < tolerance):
+        break
+
+    shifts = new_shifts
+
+viewer = napari.Viewer()
+for i, p in enumerate(predicted_tilts):
+    viewer.add_image(p.detach().numpy(), name=f"prediction at iter {i}")
+napari.run()
+
+final = filtered_back_projection(
+    tilt_series, (170, size, size), STAGE_TILT_ANGLE_PRIORS, tilt_axis_angle, shifts
+)
+
+mrcfile.write(
+    IMAGE_FILE.with_name(IMAGE_FILE.stem + "_exact.mrc"),
+    final.detach().numpy().astype(np.float32),
+    voxel_size=ALIGNMENT_PIXEL_SIZE,
+    overwrite=True,
+)
+
+# generate a proper fourier inverted reconstruction
 tomogram_center = dft_center(tomogram_dimensions, rfft=False, fftshifted=True)
 tilt_image_center = dft_center(tilt_dimensions, rfft=False, fftshifted=True)
 
@@ -258,180 +556,22 @@ r1 = Rz(tilt_axis_angle, zyx=True)
 s2 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
 M = s2 @ r1 @ r0 @ s0
 
-# coarse reconstruction
-coarse_reconstruction = backproject_fourier(
-    images=coarse_aligned,
-    rotation_matrices=torch.linalg.inv(M[:, :3, :3]),
-    rotation_matrix_zyx=True,
-    do_gridding_correction=False,
-)
-
-mrcfile.write(
-    "data/tomo200528_107.mrc",
-    coarse_reconstruction.detach().numpy().astype(np.float32),
-    voxel_size=ALIGNMENT_PIXEL_SIZE,
-    overwrite=True,
-)
-
-
-# PROJECTION MATCHING
-def projection_matching(shifts):
-    """Run projection matching."""
-    aligned_set = [REFERENCE_TILT]
-    init = REFERENCE_TILT
-    tilt_ids = torch.arange(n_tilts)
-    factor = 1
-    while init + 1 * factor < n_tilts or init - 1 * factor >= 0:
-        # new_aligned = []
-        for x in (-1, 1):
-            i = init + x * factor
-            if i < 0 or i >= n_tilts:
-                continue
-            tilt_angle = STAGE_TILT_ANGLE_PRIORS[i]
-
-            weights = einops.rearrange(
-                torch.cos(
-                    torch.deg2rad(torch.abs(STAGE_TILT_ANGLE_PRIORS - tilt_angle))
-                ),
-                "n -> n 1 1",
-            )
-            tilt_mask = torch.logical_and(
-                tilt_ids >= min(aligned_set), tilt_ids <= max(aligned_set)
-            )
-            intermediate_recon = backproject_fourier(
-                images=shift_2d(
-                    tilt_series[tilt_mask] * weights[tilt_mask],
-                    shifts=shifts[tilt_mask],
-                ),
-                rotation_matrices=torch.linalg.inv(M[:, :3, :3][tilt_mask]),
-                rotation_matrix_zyx=True,
-                do_gridding_correction=False,  # This is very important for some reason
-                pad=True,
-            )
-
-            projection = project_fourier(
-                volume=intermediate_recon,
-                rotation_matrices=torch.linalg.inv(M[i : i + 1, :3, :3]),
-                rotation_matrix_zyx=True,
-                pad=True,
-            ).squeeze()
-            projection = (projection - projection.mean()) / projection.std()
-
-            old_shift = shifts[i].clone()
-            shifts[i] = find_image_shift(
-                projection * coarse_alignment_mask,
-                tilt_series[i] * coarse_alignment_mask,
-            )
-            print(
-                f"aligning index {i} at angle {tilt_angle}: "
-                f"{torch.abs(old_shift - shifts[i])}"
-            )
-            # new_aligned.append(i)
-            aligned_set.append(i)
-        # aligned_set += new_aligned
-        factor += 1
-    return shifts
-
-
-# Do weighted back projection
-M_ramp = Rz(-tilt_axis_angle, zyx=False)[:, :2, :3]
-M_ramp[..., 2:] = 0
-
-grids = F.affine_grid(M_ramp, (n_tilts, 1, size, size), align_corners=True)
-ramp_filters = torch.fft.ifftshift(
-    F.grid_sample(
-        einops.repeat(ramp_weights, "h w -> n 1 h w", n=n_tilts),
-        grids,
-        mode="bicubic",
-        align_corners=True,
-    ).squeeze(),
-    dim=(-1, -2),
-) * low_pass_filter(
-    0.45,
-    0.05,
-    (size, size),
-    rfft=False,
-    fftshift=False,
-)
-
-weighted = torch.fft.ifftn(
-    torch.fft.fftn(coarse_aligned, dim=(-1, -2)) * ramp_filters, dim=(-1, -2)
-).real
-
-viewer = napari.Viewer()
-viewer.add_image(ramp_filters.detach().numpy())
-viewer.add_image(weighted.detach().numpy())
-napari.run()
-
-r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=False)
-r1 = Rz(tilt_axis_angle, zyx=False)
-M = r1 @ r0
-
-rec = torch.zeros((100, size, size))
-for i in range(n_tilts):
-    grid = F.affine_grid(
-        M[i : i + 1, :3], (1, 1, 100, size, size), align_corners=False  # N, C, D, H, W
-    )
-    rec += torch.squeeze(
-        F.grid_sample(
-            einops.rearrange(weighted[i], "h w -> 1 1 1 h w"),
-            grid,
-            align_corners=False,
-            mode="bilinear",
-        )
-    )
-print(rec.shape)
-viewer = napari.Viewer()
-viewer.add_image(coarse_reconstruction.detach().numpy())
-viewer.add_image(rec.detach().numpy())
-napari.run()
-
-for _ in range(2):
-    shifts = projection_matching(shifts)
-
-    fine_aligned = shift_2d(tilt_series, shifts=shifts)
-
-    tilt_axis_angle = optimize_tilt_axis_angle(
-        fine_aligned,
-        coarse_alignment_mask,
-        tilt_axis_angle,
-    )
-    print("new tilt axis angle:", tilt_axis_angle)
-
-    s0 = T(-tomogram_center)
-    r0 = Ry(STAGE_TILT_ANGLE_PRIORS, zyx=True)
-    r1 = Rz(tilt_axis_angle, zyx=True)
-    s2 = T(F.pad(tilt_image_center, pad=(1, 0), value=0))
-    M = s2 @ r1 @ r0 @ s0
-
-
 fine_reconstruction = backproject_fourier(
-    images=fine_aligned,
+    images=shift_2d(tilt_series, shifts),
     rotation_matrices=torch.linalg.inv(M[:, :3, :3]),
     rotation_matrix_zyx=True,
     do_gridding_correction=False,
 )
 
 mrcfile.write(
-    "data/tomo200528_107_fine.mrc",
+    IMAGE_FILE.with_name(IMAGE_FILE.stem + "_fine.mrc"),
     fine_reconstruction.detach().numpy().astype(np.float32),
     voxel_size=ALIGNMENT_PIXEL_SIZE,
     overwrite=True,
 )
 
 viewer = napari.Viewer()
-viewer.add_image(coarse_aligned.detach().numpy(), name="coarse aligned")
-viewer.add_image(fine_aligned.detach().numpy(), name="fine aligned")
-viewer.add_image(coarse_reconstruction.detach().numpy(), name="coarse recon")
-viewer.add_image(fine_reconstruction.detach().numpy(), name="fine recon")
+viewer.add_image(initial_reconstruction.detach().numpy(), name="initial reconstruction")
+viewer.add_image(final.detach().numpy(), name="optimized reconstruction")
+viewer.add_image(fine_reconstruction.detach().numpy(), name="fourier inverted")
 napari.run()
-
-
-roi_mask = torch.zeros_like(tilt_series)
-for i, theta in enumerate(STAGE_TILT_ANGLE_PRIORS):
-    offset = int((size // 2) * (1 - torch.abs(torch.cos(theta * math.pi / 180))))
-    if offset == 0:
-        roi_mask[i] = 1
-    else:
-        roi_mask[i, offset:-offset, :] = 1
-full_mask = roi_mask * coarse_alignment_mask
