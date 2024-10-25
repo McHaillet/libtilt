@@ -42,9 +42,14 @@ IMAGE_PIXEL_SIZE = 1.724
 STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 51, 3)  # 107: 54, 100: 51
 TILT_AXIS_ANGLE_PRIOR = -90.0  # -88.7 according to mdoc, but I set it faulty to see if
 # the optimization works
-ALIGNMENT_PIXEL_SIZE = 13.79
+ALIGNMENT_PIXEL_SIZE = IMAGE_PIXEL_SIZE * 8
 # set 0 degree tilt as reference
 REFERENCE_TILT = int(STAGE_TILT_ANGLE_PRIORS.abs().argmin())
+ALIGN_Z = int(2000 / ALIGNMENT_PIXEL_SIZE)  # number is in A
+RECON_Z = int(3000 / ALIGNMENT_PIXEL_SIZE)
+WEIGHTING = "hamming"  # weighting scheme for filtered back projection
+# the object diameter in number of pixels
+OBJECT_DIAMETER = 300 / ALIGNMENT_PIXEL_SIZE
 
 tilt_series = torch.as_tensor(mrcfile.read(IMAGE_FILE))
 
@@ -257,14 +262,24 @@ def filtered_back_projection(
     tilt_angles,
     tilt_axis_angles,
     shifts,
-    weighting="exact",
+    weighting: str = "exact",
+    object_diameter: float | None = None,
 ):
     """Run weighted back projection incorporating some alignment parameters.
 
-    ramp-weighting increases linearly from 0 to 1 from the zero frequency to nyquist
-    exact-weighting is based on and improves low-res signal on forward projection:
-        Reference : Optik, Exact filters for general geometry three-dimensional
-        reconstruction, vol.73,146,1986.
+    weighting: str, default "hamming"
+        all filters here start at 1/N (instead of 0 for ramp and hamming) which
+        improves the low res signal upon forward projection of the reconstruction
+        Options:
+            - "ramp": increases linearly from 1/N to 1 from the zero frequency to
+                nyquist
+            - "exact": is based on and improves low-res signal on forward projection:
+                Reference : Optik, Exact filters for general geometry three-dimensional
+                reconstruction, vol.73,146,1986.
+            - "hamming": modified hamming as used in AreTomo, further modified here to
+                also start a 1/N
+    object_diameter: float | None, default None
+        object diameter specified in number of pixels, only needed for the exact filter
 
     """
     # initializes sizes
@@ -299,13 +314,19 @@ def filtered_back_projection(
 
     # generate weighting function and apply to aligned tilt series
     if weighting == "exact":
+        if object_diameter is None:
+            raise ValueError(
+                "Calculation of exact weighting requires an object " "diameter."
+            )
         if len(tilt_angles) == 1:
             filters = 1
-        else:
-            freq = einops.rearrange(
+        else:  # slice_width could be provided as a function argument it can be
+            # calculated as: (pixel_size * 2 * imdim) / object_diameter
+            q = einops.rearrange(
                 torch.arange(
                     size // 2 + size % 2 + 1, dtype=torch.float32, device=device
-                ),
+                )
+                / size,
                 "q -> 1 1 q",
             )
             sampling = torch.sin(
@@ -313,25 +334,29 @@ def filtered_back_projection(
                     torch.abs(einops.rearrange(tilt_angles, "n -> n 1") - tilt_angles)
                 )
             ).to(device)
-            slice_width = einops.reduce(
-                sampling[sampling > 0.001].reshape(n_tilts, n_tilts - 1),
-                "h w -> h",
-                "min",
-            ) * (size // 2)
-            slice_width = einops.rearrange(slice_width, "n -> 1 n 1")
             sampling = einops.rearrange(sampling, "n m -> n m 1")
-
-            filters = 1 / einops.reduce(
-                torch.clip(1 - (sampling / slice_width * freq) ** 2, 0, 2),
-                "n m q -> n q",
-                "sum",
-            )
+            q_overlap_inv = sampling / (2 / object_diameter)
+            over_weighting = 1 - torch.clip(q * q_overlap_inv, min=0, max=1)
+            filters = 1 / einops.reduce(over_weighting, "n m q -> n q", "sum")
             filters = einops.rearrange(filters, "n w -> n 1 w")
     elif weighting == "ramp":
         filters = torch.arange(
             size // 2 + size % 2 + 1, dtype=torch.float32, device=device
         )
         filters /= filters.max()
+        filters = filters * (1 - 1 / n_tilts) + 1 / n_tilts  # start at 1 / N
+    elif weighting == "hamming":  # AreTomo3 code uses a modified hamming window
+        # 2 * q * (0.55f + 0.45f * cosf(6.2831852f * q))  # with q from 0 to .5 (Ny)
+        # https://github.com/czimaginginstitute/AreTomo3/blob/
+        #   c39dcdad9525ee21d7308a95622f3d47fe7ab4b9/AreTomo/Recon/GRWeight.cu#L20
+        q = (
+            torch.arange(size // 2 + size % 2 + 1, dtype=torch.float32, device=device)
+            / size
+        )
+        # filters = 2 * q * (.55 + .45 * torch.cos(2 * torch.pi * q))
+        filters = 2 * q * (0.54 + 0.46 * torch.cos(2 * torch.pi * q))
+        filters /= filters.max()  # 0-1 normalization
+        filters = filters * (1 - 1 / n_tilts) + 1 / n_tilts  # start at 1 / N
     else:
         raise ValueError("Invalid weighting option provided for FBP.")
 
@@ -369,7 +394,7 @@ def filtered_back_projection(
                 mode="bilinear",
             )
         )
-    return reconstruction
+    return reconstruction, aligned
 
 
 def predict_projection(
@@ -453,6 +478,7 @@ def projection_matching(
 
     # if debug:  # for debug mode, store the predicted projections
     projections = torch.zeros((n_tilts, size, size))
+    projections[reference_tilt_id] = tilt_series[reference_tilt_id]
 
     for i in index_sequence:
         tilt_angle = tilt_angles[i]
@@ -460,12 +486,14 @@ def projection_matching(
             torch.cos(torch.deg2rad(torch.abs(tilt_angles - tilt_angle))),
             "n -> n 1 1",
         )
-        intermediate_recon = filtered_back_projection(
+        intermediate_recon, _ = filtered_back_projection(
             (tilt_series[aligned_set,] * weights[aligned_set,]).to("cuda"),
             tomogram_dimensions,
             tilt_angles[aligned_set,],
             tilt_axis_angles[aligned_set,],
             shifts[aligned_set,],
+            weighting=WEIGHTING,
+            object_diameter=OBJECT_DIAMETER,
         )
         projection, projection_weights = predict_projection(
             intermediate_recon,
@@ -495,8 +523,14 @@ def projection_matching(
 
 
 # coarse reconstruction
-initial_reconstruction = filtered_back_projection(
-    tilt_series, (170, size, size), STAGE_TILT_ANGLE_PRIORS, tilt_axis_angle, shifts
+initial_reconstruction, _ = filtered_back_projection(
+    tilt_series,
+    (RECON_Z, size, size),
+    STAGE_TILT_ANGLE_PRIORS,
+    tilt_axis_angle,
+    shifts,
+    weighting=WEIGHTING,
+    object_diameter=OBJECT_DIAMETER,
 )
 
 
@@ -515,7 +549,7 @@ for i in range(max_iter):
 
     new_shifts, pred = projection_matching(
         tilt_series,
-        (160, size, size),
+        (ALIGN_Z, size, size),
         REFERENCE_TILT,
         STAGE_TILT_ANGLE_PRIORS,
         tilt_axis_angle,
@@ -535,8 +569,14 @@ for i, p in enumerate(predicted_tilts):
     viewer.add_image(p.detach().numpy(), name=f"prediction at iter {i}")
 napari.run()
 
-final = filtered_back_projection(
-    tilt_series, (170, size, size), STAGE_TILT_ANGLE_PRIORS, tilt_axis_angle, shifts
+final, aligned_ts = filtered_back_projection(
+    tilt_series,
+    (RECON_Z, size, size),
+    STAGE_TILT_ANGLE_PRIORS,
+    tilt_axis_angle,
+    shifts,
+    weighting=WEIGHTING,
+    object_diameter=OBJECT_DIAMETER,
 )
 
 mrcfile.write(
@@ -574,4 +614,5 @@ viewer = napari.Viewer()
 viewer.add_image(initial_reconstruction.detach().numpy(), name="initial reconstruction")
 viewer.add_image(final.detach().numpy(), name="optimized reconstruction")
 viewer.add_image(fine_reconstruction.detach().numpy(), name="fourier inverted")
+viewer.add_image(aligned_ts.detach().numpy(), name="aligned_ts")
 napari.run()
