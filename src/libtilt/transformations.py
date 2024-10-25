@@ -104,6 +104,53 @@ def Rz(angles_degrees: torch.Tensor, zyx: bool = False) -> torch.Tensor:
     return matrices
 
 
+def T(shifts: torch.Tensor) -> torch.Tensor:
+    """4x4 matrices for translations.
+
+    Parameters
+    ----------
+    shifts: torch.Tensor
+        `(..., 3)` array of shifts.
+
+    Returns
+    -------
+    matrices: torch.Tensor
+        `(..., 4, 4)` array of 4x4 shift matrices.
+    """
+    shifts = torch.atleast_1d(torch.as_tensor(shifts))
+    shifts, ps = einops.pack([shifts], pattern="* coords")  # to 2d
+    n = shifts.shape[0]
+    matrices = einops.repeat(torch.eye(4), "i j -> n i j", n=n).clone()
+    matrices[:, :3, 3] = shifts
+    [matrices] = einops.unpack(matrices, packed_shapes=ps, pattern="* i j")
+    return matrices
+
+
+def S(scale_factors: torch.Tensor) -> torch.Tensor:
+    """4x4 matrices for scaling.
+
+    Parameters
+    ----------
+    scale_factors: torch.Tensor
+        `(..., 3)` array of scale factors.
+
+    Returns
+    -------
+    matrices: torch.Tensor
+        `(..., 4, 4)` array of 4x4 shift matrices.
+    """
+    scale_factors = torch.atleast_1d(torch.as_tensor(scale_factors))
+    scale_factors, ps = einops.pack([scale_factors], pattern="* coords")  # to 2d
+    n = scale_factors.shape[0]
+    matrices = einops.repeat(torch.eye(4), "i j -> n i j", n=n).clone()
+    matrices[:, [0, 1, 2], [0, 1, 2]] = scale_factors
+    [matrices] = einops.unpack(matrices, packed_shapes=ps, pattern="* i j")
+    return matrices
+
+
+# Matrices for 2D transformations
+
+
 def R_2d(angles_degrees: torch.Tensor, yx: bool = False) -> torch.Tensor:
     """3x3 matrices for a rotation of homogenous coordinates around the X-axis.
 
@@ -136,28 +183,6 @@ def R_2d(angles_degrees: torch.Tensor, yx: bool = False) -> torch.Tensor:
     return matrices
 
 
-def T(shifts: torch.Tensor) -> torch.Tensor:
-    """4x4 matrices for translations.
-
-    Parameters
-    ----------
-    shifts: torch.Tensor
-        `(..., 3)` array of shifts.
-
-    Returns
-    -------
-    matrices: torch.Tensor
-        `(..., 4, 4)` array of 4x4 shift matrices.
-    """
-    shifts = torch.atleast_1d(torch.as_tensor(shifts))
-    shifts, ps = einops.pack([shifts], pattern="* coords")  # to 2d
-    n = shifts.shape[0]
-    matrices = einops.repeat(torch.eye(4), "i j -> n i j", n=n).clone()
-    matrices[:, :3, 3] = shifts
-    [matrices] = einops.unpack(matrices, packed_shapes=ps, pattern="* i j")
-    return matrices
-
-
 def T_2d(shifts: torch.Tensor) -> torch.Tensor:
     """3x3 matrices for translations.
 
@@ -180,23 +205,23 @@ def T_2d(shifts: torch.Tensor) -> torch.Tensor:
     return matrices
 
 
-def S(scale_factors: torch.Tensor) -> torch.Tensor:
+def S_2d(scale_factors: torch.Tensor) -> torch.Tensor:
     """4x4 matrices for scaling.
 
     Parameters
     ----------
     scale_factors: torch.Tensor
-        `(..., 3)` array of scale factors.
+        `(..., 2)` array of scale factors.
 
     Returns
     -------
     matrices: torch.Tensor
-        `(..., 4, 4)` array of 4x4 shift matrices.
+        `(..., 3, 3)` array of 3x3 shift matrices.
     """
     scale_factors = torch.atleast_1d(torch.as_tensor(scale_factors))
     scale_factors, ps = einops.pack([scale_factors], pattern="* coords")  # to 2d
     n = scale_factors.shape[0]
-    matrices = einops.repeat(torch.eye(4), "i j -> n i j", n=n).clone()
-    matrices[:, [0, 1, 2], [0, 1, 2]] = scale_factors
+    matrices = einops.repeat(torch.eye(3), "i j -> n i j", n=n).clone()
+    matrices[:, [0, 1], [0, 1]] = scale_factors
     [matrices] = einops.unpack(matrices, packed_shapes=ps, pattern="* i j")
     return matrices
