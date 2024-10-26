@@ -403,7 +403,6 @@ def predict_projection(
     tilt_angles,
     tilt_axis_angles,
     shifts,
-    view: bool = False,
 ):
     """Predict a projection from an intermediate reconstruction.
 
@@ -428,7 +427,7 @@ def predict_projection(
 
     grid = homogenise_coordinates(coordinate_grid(tomogram_dimensions, device=device))
     grid = einops.rearrange(grid, "d h w coords -> d h w coords 1")
-    grid = M @ grid
+    torch.matmul(M, grid, out=grid)
     grid = einops.rearrange(grid, "... d h w coords 1 -> ... d h w coords")[
         ..., :3
     ].contiguous()
@@ -441,14 +440,9 @@ def predict_projection(
             mode="bilinear",
         )
     )
-    if view:
-        viewer = napari.Viewer()
-        layer = viewer.add_image(rotated.to("cpu").detach().numpy())
-        layer._keep_auto_contrast = True
-        napari.run()
     projection = rotated.mean(axis=-3)
     weights = (rotated != 0).sum(axis=-3)
-    weights = weights / weights.max()
+    torch.div(weights, weights.max(), out=weights)
     return projection, weights
 
 
@@ -501,7 +495,6 @@ def projection_matching(
             tilt_angles[[i],],
             tilt_axis_angles[[i],],
             shifts[[i],],
-            # view=i==33
         )  # TODO the volume edges introduce edges in the projected image
         # ensure correlation in relevant area
         projection_weights *= alignment_mask.to("cuda")
@@ -565,6 +558,7 @@ for i in range(max_iter):
     shifts = new_shifts
 
 viewer = napari.Viewer()
+viewer.add_image(tilt_series.detach().numpy(), name="raw tilts")
 for i, p in enumerate(predicted_tilts):
     viewer.add_image(p.detach().numpy(), name=f"prediction at iter {i}")
 napari.run()
