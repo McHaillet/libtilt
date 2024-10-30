@@ -1,17 +1,40 @@
-import torch
 import numpy as np
-import torch.nn.functional as F
-import einops
+import torch
 
 from libtilt.correlation import correlate_2d
 from libtilt.fft_utils import dft_center
 
 
+def norm_under_mask(image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Normalize an image by only calculating mean and std in the region of the mask.
+
+    Parameters
+    ----------
+    image: torch.Tensor
+        `(h, w)` image.
+    mask: torch.Tensor
+        `(h, w)` mask used for calculating normalization
+
+    Returns
+    -------
+    out: torch.Tensor
+        `(h, w)` normalized image
+    """
+    weight = mask.sum()
+    mean = (image * mask).sum() / weight
+    std = ((image**2 * mask).sum() / weight - mean**2) ** 0.5
+    out = (image - mean) / std
+    return out
+
+
 def find_image_shift(
-        image_a: torch.Tensor,
-        image_b: torch.Tensor,
-) -> torch.Tensor:
-    """Find the shift between image a and b. Applying the shift to b aligns it with
+    image_a: torch.Tensor,
+    image_b: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Find the shift between image a and b.
+
+    Applying the shift to b aligns it with
     image a. The region around the maximum in the correlation image is by default
     upsampled with bicubic interpolation to find a more precise shift.
 
@@ -21,25 +44,30 @@ def find_image_shift(
         `(h, w)` image.
     image_b: torch.Tensor
         `(h, w)` image with the same shape as image_a
+    mask: torch.Tensor | None, default None
+        `(h, w)` mask used for normalization
 
     Returns
     -------
-    shift: torch.Tensor
-        `(2, )` shift in y and x.
+    shift, correlation: torch.Tensor, torch.Tensor
+        `(2, )` shift in y and x; and maximal correlation
     """
     center = dft_center(
         image_a.shape, rfft=False, fftshifted=True, device=image_a.device
     )
 
     # calculate initial shift with integer precision
-    correlation = correlate_2d(
-        image_a,
-        image_b,
-        normalize=True
-    )
+    if mask is not None:
+        correlation = correlate_2d(
+            norm_under_mask(image_a, mask) * mask,
+            norm_under_mask(image_b, mask) * mask,
+            normalize=False,
+        )
+    else:
+        correlation = correlate_2d(image_a, image_b, normalize=True)
     maximum_idx = torch.tensor(  # explicitly put tensor on CPU in case input is on GPU
         np.unravel_index(correlation.argmax().cpu(), shape=image_a.shape),
-        device=image_a.device
+        device=image_a.device,
     )
     y, x = maximum_idx
     # Parabolic interpolation in the y direction

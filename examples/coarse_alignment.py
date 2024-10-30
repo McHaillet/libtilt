@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch_cubic_spline_grids import CubicBSplineGrid1d
 
-from libtilt.alignment import find_image_shift
+from libtilt.alignment import find_image_shift, norm_under_mask
 from libtilt.backprojection import backproject_fourier
 from libtilt.coordinate_utils import array_to_grid_sample, homogenise_coordinates
 from libtilt.fft_utils import dft_center
@@ -70,11 +70,12 @@ def stretch_image(image, stretch, tilt_axis):
     image_center = dft_center(image.shape, rfft=False, fftshifted=True)
     # construct matrix
     s0 = T_2d(-image_center)
-    m_rotate_backward = R_2d(tilt_axis, yx=True)
-    m_rotate_forward = torch.linalg.inv(m_rotate_backward)
-    m_scale = torch.tensor([[stretch, 0, 0], [0, 1, 0], [0, 0, 1]])
+    r_forward = R_2d(tilt_axis, yx=True)
+    r_backward = torch.linalg.inv(r_forward)
+    m_stretch = torch.eye(3)
+    m_stretch[1, 1] = stretch  # this is a shear matrix
     s1 = T_2d(image_center)
-    m_affine = s1 @ m_rotate_backward @ m_scale @ m_rotate_forward @ s0
+    m_affine = s1 @ r_forward @ m_stretch @ r_backward @ s0
     # transform image
     stretched = affine_transform_2d(
         image,
@@ -83,9 +84,9 @@ def stretch_image(image, stretch, tilt_axis):
     return stretched
 
 
-IMAGE_FILE = Path("data/tomo200528_107.st")
+IMAGE_FILE = Path("data/tomo200528_100.st")
 IMAGE_PIXEL_SIZE = 1.724
-STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 54, 3)  # 107: 54, 100: 51
+STAGE_TILT_ANGLE_PRIORS = torch.arange(-51, 51, 3)  # 107: 54, 100: 51
 TILT_AXIS_ANGLE_PRIOR = -90.0  # -88.7 according to mdoc, but I set it faulty to see if
 # the optimization works
 ALIGNMENT_PIXEL_SIZE = IMAGE_PIXEL_SIZE * 8
@@ -134,38 +135,38 @@ center = dft_center(tilt_dimensions, rfft=False, fftshifted=True)
 # masked_tilts = tilt_series * coarse_alignment_mask
 
 
-def coarse_align_without_stretch(
+def coarse_align(
     tilt_series: torch.Tensor,
     reference_tilt_id: int,
+    mask: torch.Tensor,
 ):
     """Find coarse shifts of images without stretching along tilt axis."""
-    correlation_sum = torch.tensor(0.0)
     shifts = torch.zeros((len(tilt_series), 2), dtype=torch.float32)
     # find coarse alignment for negative tilts
     current_shift = torch.zeros(2)
     for i in range(reference_tilt_id, 0, -1):
-        shift, ccc = find_image_shift(
+        shift = find_image_shift(
             tilt_series[i],
             tilt_series[i - 1],
+            mask,
         )
-        correlation_sum += ccc
         current_shift += shift
         shifts[i - 1] = current_shift
 
     # find coarse alignment positive tilts
     current_shift = torch.zeros(2)
     for i in range(reference_tilt_id, tilt_series.shape[0] - 1, 1):
-        shift, ccc = find_image_shift(
+        shift = find_image_shift(
             tilt_series[i],
             tilt_series[i + 1],
+            mask,
         )
-        correlation_sum += ccc
         current_shift += shift
         shifts[i + 1] = current_shift
-    return shifts, correlation_sum
+    return shifts
 
 
-def coarse_align(
+def stretch_align(
     tilt_series: torch.Tensor,
     reference_tilt_id: int,
     mask: torch.Tensor,
@@ -173,73 +174,107 @@ def coarse_align(
     tilt_axis_angles: torch.Tensor,
 ):
     """Find coarse shifts of images while stretching each pair along the tilt axis."""
-    correlation_sum = torch.tensor(0.0)
     shifts = torch.zeros((len(tilt_series), 2), dtype=torch.float32)
     # find coarse alignment for negative tilts
     current_shift = torch.zeros(2)
     for i in range(reference_tilt_id, 0, -1):
-        shift, ccc = find_image_shift(
-            tilt_series[i] * mask,
-            stretch_image(
-                tilt_series[i - 1],
-                math.cos(math.radians(tilt_angles[i - 1]))
-                / math.cos(math.radians(tilt_angles[i])),
-                tilt_axis_angles[i - 1],
-            )
-            * mask,
+        scale_factor = math.cos(math.radians(tilt_angles[i - 1])) / math.cos(
+            math.radians(tilt_angles[i])
         )
-        correlation_sum += ccc
+        stretched = stretch_image(
+            tilt_series[i - 1],
+            scale_factor,
+            tilt_axis_angles[i - 1],
+        )
+        shift = find_image_shift(
+            tilt_series[i],
+            stretched,
+            mask,
+        )
         current_shift += shift
         shifts[i - 1] = current_shift
-
     # find coarse alignment positive tilts
     current_shift = torch.zeros(2)
     for i in range(reference_tilt_id, tilt_series.shape[0] - 1, 1):
-        shift, ccc = find_image_shift(
-            tilt_series[i] * mask,
-            stretch_image(
-                tilt_series[i + 1],
-                math.cos(math.radians(tilt_angles[i + 1]))
-                / math.cos(math.radians(tilt_angles[i])),
-                tilt_axis_angles[i + 1],
-            )
-            * mask,
+        scale_factor = math.cos(math.radians(tilt_angles[i + 1])) / math.cos(
+            math.radians(tilt_angles[i])
         )
-        correlation_sum += ccc
+        stretched = stretch_image(
+            tilt_series[i + 1],
+            scale_factor,
+            tilt_axis_angles[i + 1],
+        )
+        shift = find_image_shift(
+            tilt_series[i],
+            stretched,
+            mask,
+        )
         current_shift += shift
         shifts[i + 1] = current_shift
-    return shifts, correlation_sum
+    return shifts
 
 
-coarse_shifts, ccc_sum = coarse_align_without_stretch(
-    tilt_series * coarse_alignment_mask,
-    REFERENCE_TILT,
-)
-coarse_aligned = shift_2d(tilt_series, shifts=coarse_shifts)
+def stretch_correlation(
+    tilt_series: torch.Tensor,
+    reference_tilt_id: int,
+    mask: torch.Tensor,
+    tilt_angles: torch.Tensor,
+    tilt_axis_angles: torch.Tensor,
+    shifts: torch.Tensor,
+):
+    """Find coarse shifts of images while stretching each pair along the tilt axis."""
+    sq_diff = torch.tensor(0.0)
+    for i in range(reference_tilt_id, 0, -1):
+        scale_factor = torch.cos(torch.deg2rad(tilt_angles[i - 1 : i])) / torch.cos(
+            torch.deg2rad(tilt_angles[i : i + 1])
+        )
+        stretched = stretch_image(
+            tilt_series[i - 1],
+            scale_factor,
+            tilt_axis_angles[i - 1],
+        )
+        # transform image
+        stretched = affine_transform_2d(
+            stretched,
+            T_2d(shifts[i - 1] - shifts[i]),
+        )
+        non_empty = (stretched != 0) * 1.0
+        correlation_mask = non_empty * mask
+        norm_a = norm_under_mask(tilt_series[i], correlation_mask)
+        norm_b = norm_under_mask(stretched, correlation_mask)
+        sq_diff = (
+            sq_diff
+            + ((norm_a - norm_b) ** 2 * correlation_mask).sum() / correlation_mask.sum()
+        )
 
-# # find coarse alignment for negative tilts
-# current_shift = torch.zeros(2)
-# for i in range(REFERENCE_TILT, 0, -1):
-#     shift = find_image_shift(
-#         masked_tilts[i],
-#         masked_tilts[i - 1],
-#     )
-#     current_shift += shift
-#     coarse_shifts[i - 1] = current_shift
-#
-# # find coarse alignment positive tilts
-# current_shift = torch.zeros(2)
-# for i in range(REFERENCE_TILT, tilt_series.shape[0] - 1, 1):
-#     shift = find_image_shift(
-#         masked_tilts[i],
-#         masked_tilts[i + 1],
-#     )
-#     current_shift += shift
-#     coarse_shifts[i + 1] = current_shift
+    # find coarse alignment positive tilts
+    for i in range(reference_tilt_id, tilt_series.shape[0] - 1, 1):
+        scale_factor = torch.cos(torch.deg2rad(tilt_angles[i + 1 : i + 2])) / torch.cos(
+            torch.deg2rad(tilt_angles[i : i + 1])
+        )
+        stretched = stretch_image(
+            tilt_series[i + 1],
+            scale_factor,
+            tilt_axis_angles[i + 1],
+        )
+        # transform image
+        stretched = affine_transform_2d(
+            stretched,
+            T_2d(shifts[i + 1] - shifts[i]),
+        )
+        non_empty = (stretched != 0) * 1.0
+        correlation_mask = non_empty * mask
+        norm_a = norm_under_mask(tilt_series[i], correlation_mask)
+        norm_b = norm_under_mask(stretched, correlation_mask)
+        sq_diff = (
+            sq_diff
+            + ((norm_a - norm_b) ** 2 * correlation_mask).sum() / correlation_mask.sum()
+        )
+    return sq_diff
 
 
 def optimize_tilt_axis_angle(
-    aligned_ts, coarse_alignment_mask, initial_tilt_axis_angle
+    aligned_ts, coarse_alignment_mask, initial_tilt_axis_angle, grid_points: int = 1
 ):
     """Optimize tilt axis angles on a spline grid using the LBFGS optimizer."""
     coarse_aligned_masked = aligned_ts * coarse_alignment_mask
@@ -251,13 +286,12 @@ def optimize_tilt_axis_angle(
     mask_weights /= mask_weights.max()  # normalise to 0 and 1
 
     # optimize tilt axis angle
-    grid_resolution = 3
-    tilt_axis_grid = CubicBSplineGrid1d(resolution=grid_resolution, n_channels=1)
+    tilt_axis_grid = CubicBSplineGrid1d(resolution=grid_points, n_channels=1)
     tilt_axis_grid.data = torch.tensor(
         [
             torch.mean(initial_tilt_axis_angle),
         ]
-        * grid_resolution,
+        * grid_points,
         dtype=torch.float32,
     )
     interpolation_points = torch.linspace(0, 1, len(tilt_series))
@@ -311,12 +345,18 @@ def optimize_tilt_axis_angle(
     return tilt_axis_angles.detach()
 
 
+# coarse xcorr alignment
+coarse_shifts = coarse_align(tilt_series, REFERENCE_TILT, coarse_alignment_mask)
+coarse_aligned = shift_2d(tilt_series, shifts=coarse_shifts)
+
 tilt_axis_angle = torch.tensor(TILT_AXIS_ANGLE_PRIOR)
 tilt_angle_offset = None
-shifts = None
+shifts = coarse_shifts.clone()
 reference_tilt = REFERENCE_TILT
-for i in range(2):
-    print(f"iteration {i}")
+tilt_angles = STAGE_TILT_ANGLE_PRIORS.clone()
+
+for _ in range(3):  # optimize tilt axis angle
+
     tilt_axis_angle = optimize_tilt_axis_angle(
         coarse_aligned,
         coarse_alignment_mask,
@@ -324,62 +364,53 @@ for i in range(2):
     )
     print("new tilt axis angle:", tilt_axis_angle)
 
+    shifts = stretch_align(
+        tilt_series, reference_tilt, coarse_alignment_mask, tilt_angles, tilt_axis_angle
+    )
+
+    coarse_aligned = shift_2d(tilt_series, shifts=shifts)
+
+for i in range(3):
+    print(f"stretching iteration {i}")
+
     tilt_angle_offset = torch.tensor([0.0], requires_grad=True)
+    # shift_offset = torch.tensor([.0, .0], requires_grad=True)
     lbfgs = torch.optim.LBFGS(
-        [tilt_angle_offset],
+        [tilt_angle_offset],  # , shift_offset],
         history_size=10,
         max_iter=4,
         line_search_fn="strong_wolfe",
     )
 
-    # def closure():
-    #     i = int((STAGE_TILT_ANGLE_PRIORS + tilt_angle_offset).abs().argmin())
-    #     print(STAGE_TILT_ANGLE_PRIORS + tilt_angle_offset)
-    #     _, ccc_sum = coarse_align(
-    #         tilt_series,
-    #         i,
-    #         coarse_alignment_mask,
-    #         STAGE_TILT_ANGLE_PRIORS + tilt_angle_offset,
-    #         tilt_axis_angle,
-    #     )
-    #     ccc_sum.requires_grad = True
-    #     print(ccc_sum)
-    #     lbfgs.zero_grad()
-    #     loss = -1 * ccc_sum
-    #     loss.backward()
-    #     return loss
-    #
-    # for _ in range(3):
-    #     lbfgs.step(closure)
-
-    #     # print("new shifts:", shifts)
-    #     print(ccc_sum)
-    #     if ccc_sum > ccc_max:
-    #         ccc_max = ccc_sum
-    #         shifts = current_shifts
-    #         reference_tilt = i
-    #         tilt_angle_offset = offset
-    # print(f"max ccc {ccc_max} at index {reference_tilt} and angle"
-    #       f" {STAGE_TILT_ANGLE_PRIORS[reference_tilt]}")
-
-    global_shift, ccc_max = None, 0
-    for shift in range(-50, 50, 5):
-        _, ccc_sum = coarse_align(
-            shift_2d(tilt_series, shifts=torch.tensor([shift, 0.0])),
-            reference_tilt,
+    def closure(shifts=shifts, lbfgs=lbfgs, tilt_angle_offset=tilt_angle_offset):
+        """Calculate mean squared difference of stretching alignment."""
+        new_tilt_angles = STAGE_TILT_ANGLE_PRIORS + tilt_angle_offset
+        new_ref = int((new_tilt_angles).abs().argmin())
+        # new_shifts = shifts - shifts[new_ref]
+        # new_shifts = new_shifts + einops.rearrange(shift_offset, 'n -> 1 n')
+        loss = stretch_correlation(
+            tilt_series,
+            new_ref,
             coarse_alignment_mask,
-            STAGE_TILT_ANGLE_PRIORS + tilt_angle_offset,
+            new_tilt_angles,
             tilt_axis_angle,
+            shifts,
         )
-        print(f"ccc after global shift of tilt axis: {ccc_sum}")
-        if ccc_sum > ccc_max:
-            global_shift = torch.tensor([shift, 0.0])
-            ccc_max = ccc_sum
+        print(loss)
+        lbfgs.zero_grad()
+        loss.backward()
+        return loss
 
-    coarse_aligned = shift_2d(tilt_series, shifts=shifts)
-    viewer = napari.Viewer()
-    viewer.add_image(coarse_aligned.detach().numpy())
-    napari.run()
+    for _ in range(3):
+        lbfgs.step(closure)
+    print(tilt_angle_offset)
+    # print(shift_offset)
+    tilt_angles = STAGE_TILT_ANGLE_PRIORS + tilt_angle_offset.detach()
+    reference_tilt = int((tilt_angles).abs().argmin())
+
+    shifts = stretch_align(
+        tilt_series, reference_tilt, coarse_alignment_mask, tilt_angles, tilt_axis_angle
+    )
 
 
 def filtered_back_projection(
@@ -416,7 +447,7 @@ def filtered_back_projection(
     tilt_image_center = dft_center(tilt_image_dimensions, rfft=False, fftshifted=True)
 
     # generate the 2d alignment affine matrix
-    s0 = T_2d(-tilt_image_center)
+    s0 = T_2d(-tilt_image_center)  # TODO shifts should come before rotation
     r0 = R_2d(tilt_axis_angles, yx=True)
     s1 = T_2d(-shifts)
     s2 = T_2d(tilt_image_center)
@@ -542,7 +573,7 @@ def predict_projection(
     # TODO project to proper image dimensions
 
     # time for real space projection
-    s0 = T(-tomogram_center)
+    s0 = T(-tomogram_center)  # TODO shifts should come before rotations
     r0 = Ry(tilt_angles, zyx=True)
     r1 = Rz(tilt_axis_angles, zyx=True)
     s1 = T(F.pad(-shifts, pad=(1, 0), value=0))
@@ -598,6 +629,7 @@ def projection_matching(
 
     # if debug:  # for debug mode, store the predicted projections
     projections = torch.zeros((n_tilts, size, size))
+    masks = torch.zeros((n_tilts, size, size))
     projections[reference_tilt_id] = tilt_series[reference_tilt_id]
 
     for i in index_sequence:
@@ -625,8 +657,9 @@ def projection_matching(
         # ensure correlation in relevant area
         projection_weights *= alignment_mask.to("cuda")
         shift = find_image_shift(
-            tilt_series[i].to("cuda") * projection_weights,
-            projection * projection_weights,
+            tilt_series[i].to("cuda"),
+            projection,
+            projection_weights,  # normalization mask
         )
         shifts[i] -= shift.to("cpu")
         aligned_set.append(i)
@@ -636,24 +669,33 @@ def projection_matching(
         )
 
         # for debug
-        projections[i] = (projection * projection_weights).detach().to("cpu")
+        # projections[i] = (projection * projection_weights).detach().to("cpu")
+        projections[i] = projection.detach().to("cpu")
+        masks[i] = projection_weights.detach().to("cpu")
+
+    # viewer = napari.Viewer()
+    # viewer.add_image(tilt_series.detach().numpy(), name='raw')
+    # viewer.add_image(projections.detach().numpy(), name='pred')
+    # viewer.add_image(masks.detach().numpy(), name='mask')
+    # napari.run()
 
     return shifts, projections
 
 
 # coarse reconstruction
+coarse_aligned = shift_2d(tilt_series, shifts=shifts)
 initial_reconstruction, _ = filtered_back_projection(
     tilt_series,
     (RECON_Z, size, size),
-    STAGE_TILT_ANGLE_PRIORS,  # + offset,
+    tilt_angles,  # STAGE_TILT_ANGLE_PRIORS
     tilt_axis_angle,
     shifts,
     weighting=WEIGHTING,
     object_diameter=OBJECT_DIAMETER,
 )
-viewer = napari.Viewer()
-viewer.add_image(initial_reconstruction.detach().numpy())
-napari.run()
+# viewer = napari.Viewer()
+# viewer.add_image(initial_reconstruction.detach().numpy())
+# napari.run()
 
 # some optimizations parameters
 max_iter = 10  # this seems solid
@@ -665,14 +707,15 @@ for i in range(max_iter):
         shift_2d(tilt_series, shifts=shifts),
         coarse_alignment_mask,
         tilt_axis_angle,
+        grid_points=3,
     )
     print("new tilt axis angle:", tilt_axis_angle)
 
     new_shifts, pred = projection_matching(
         tilt_series,
         (ALIGN_Z, size, size),
-        REFERENCE_TILT,
-        STAGE_TILT_ANGLE_PRIORS,
+        reference_tilt,  # REFERENCE_TILT,
+        tilt_angles,
         tilt_axis_angle,
         shifts,
         coarse_alignment_mask,
@@ -685,11 +728,11 @@ for i in range(max_iter):
 
     shifts = new_shifts
 
-viewer = napari.Viewer()
-viewer.add_image(tilt_series.detach().numpy(), name="raw tilts")
-for i, p in enumerate(predicted_tilts):
-    viewer.add_image(p.detach().numpy(), name=f"prediction at iter {i}")
-napari.run()
+# viewer = napari.Viewer()
+# viewer.add_image(tilt_series.detach().numpy(), name="raw tilts")
+# for i, p in enumerate(predicted_tilts):
+#     viewer.add_image(p.detach().numpy(), name=f"prediction at iter {i}")
+# napari.run()
 
 final, aligned_ts = filtered_back_projection(
     tilt_series,

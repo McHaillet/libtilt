@@ -206,7 +206,7 @@ def T_2d(shifts: torch.Tensor) -> torch.Tensor:
 
 
 def S_2d(scale_factors: torch.Tensor) -> torch.Tensor:
-    """4x4 matrices for scaling.
+    """3x3 matrices for scaling.
 
     Parameters
     ----------
